@@ -6,7 +6,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv(Path(__file__).with_name(".env"))
-from customer_auth import router
+from customer_auth import router as auth_router
+from catalog import router as catalog_router
 
 app = FastAPI(title="Canteen Customer API")
 app.add_middleware(
@@ -16,7 +17,8 @@ app.add_middleware(
     allow_methods=["GET"],
     allow_headers=["Authorization"],
 )
-app.include_router(router)
+app.include_router(auth_router)
+app.include_router(catalog_router)
 
 
 @app.get("/health")
