@@ -11,7 +11,7 @@ USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,31}$")
 
 
 class LoginRequest(BaseModel):
-    email: str = Field(min_length=3, max_length=254)
+    username: str = Field(min_length=3, max_length=32)
     password: str = Field(min_length=8, max_length=128)
 
 
@@ -43,9 +43,12 @@ def _session_payload(auth_response) -> dict:
 @router.post("/login")
 def login(body: LoginRequest, response: Response):
     response.headers["Cache-Control"] = "no-store"
+    username = body.username.strip().lower()
     try:
+        account = staff_db().table("staff_accounts").select("email").eq("username", username).limit(1).execute().data or []
+        email = account[0]["email"] if account else f"{username}@accounts.canteen.local"
         result = staff_auth_client().auth.sign_in_with_password({
-            "email": body.email.strip().lower(), "password": body.password,
+            "email": email, "password": body.password,
         })
     except Exception:
         raise HTTPException(401, "Incorrect email or password") from None
@@ -98,7 +101,7 @@ def create_store(body: CreateStoreRequest, _admin=Depends(current_admin)):
         raise HTTPException(422, "Username must be 3-32 lowercase letters, numbers, dot, dash or underscore")
     if username == "admin":
         raise HTTPException(422, "This username is reserved")
-    email = f"{username}@btadapp.com"
+    email = f"{username}@accounts.canteen.local"
     try:
         created = staff_db().auth.admin.create_user({
             "email": email, "password": body.password, "email_confirm": True,
@@ -109,7 +112,7 @@ def create_store(body: CreateStoreRequest, _admin=Depends(current_admin)):
     try:
         store = staff_db().table("stores").insert({"id": store_id, "name": name, "is_open": True}).execute().data[0]
         staff_db().table("staff_accounts").insert({
-            "user_id": store_id, "email": email, "role": "merchant", "store_id": store_id,
+            "user_id": store_id, "username": username, "email": email, "role": "merchant", "store_id": store_id,
         }).execute()
     except Exception:
         try:

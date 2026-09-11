@@ -35,8 +35,11 @@ class StaffSecurityTests(unittest.TestCase):
         with patch('admin_api.staff_auth_client') as auth, patch('admin_api.staff_db') as database:
             auth.return_value.auth.sign_in_with_password.return_value = SimpleNamespace(
                 user=SimpleNamespace(id='admin'), session=SimpleNamespace(access_token='access', refresh_token='refresh', expires_in=3600))
-            database.return_value.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value.data = [{'role': 'admin'}]
-            result = self.client.post('/staff/login', json={'email':'admin@btadapp.com','password':'test-password'})
+            database.return_value.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.side_effect = [
+                SimpleNamespace(data=[{'email': 'admin@btadapp.com'}]),
+                SimpleNamespace(data=[{'role': 'admin'}]),
+            ]
+            result = self.client.post('/staff/login', json={'username':'admin','password':'test-password'})
             self.assertEqual(result.status_code, 200)
             database.return_value.auth.sign_in_with_password.assert_not_called()
 

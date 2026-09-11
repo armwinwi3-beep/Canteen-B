@@ -2,6 +2,7 @@ begin;
 
 create table if not exists public.staff_accounts (
   user_id uuid primary key references auth.users(id) on delete cascade,
+  username text not null unique,
   email text not null unique,
   role text not null check (role in ('admin', 'merchant')),
   store_id text unique references public.stores(id) on delete cascade,

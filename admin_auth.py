@@ -35,7 +35,7 @@ def current_staff(credentials: HTTPAuthorizationCredentials = Depends(bearer)) -
 
     rows = (
         staff_db().table("staff_accounts")
-        .select("user_id,email,role,store_id")
+        .select("user_id,username,email,role,store_id")
         .eq("user_id", str(auth_user.id)).limit(1).execute().data or []
     )
     if rows:
