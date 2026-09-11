@@ -79,6 +79,31 @@ def list_products(store_id: str, response: Response, _customer=Depends(current_c
         raise HTTPException(503, "Unable to load products") from None
     return {"store": store_rows[0], "products": products}
 
+
+@router.get("/orders")
+def list_customer_orders(response: Response, customer=Depends(current_customer)):
+    _no_store_cache(response)
+    try:
+        orders = (
+            customer_db().table("orders")
+            .select("id,order_code,merchant_id,total_price,status,created_at")
+            .eq("customer_id", customer["id"])
+            .order("created_at", desc=True)
+            .limit(50)
+            .execute().data or []
+        )
+        order_ids = [order["id"] for order in orders]
+        merchant_ids = list({order["merchant_id"] for order in orders})
+        items = customer_db().table("order_items").select("id,order_id,name,qty,price").in_("order_id", order_ids).execute().data or [] if order_ids else []
+        stores = customer_db().table("stores").select("id,name").in_("id", merchant_ids).execute().data or [] if merchant_ids else []
+    except Exception:
+        raise HTTPException(503, "Unable to load orders") from None
+    items_by_order: dict[str, list] = {}
+    for item in items:
+        items_by_order.setdefault(str(item["order_id"]), []).append(item)
+    store_names = {str(store["id"]): store["name"] for store in stores}
+    return {"orders": [{**order, "store_name": store_names.get(str(order["merchant_id"]), "ร้านอาหาร"), "items": items_by_order.get(str(order["id"]), [])} for order in orders]}
+
 @router.post("/orders", status_code=201)
 def create_order(body: OrderCreate, customer=Depends(current_customer)):
     db = customer_db()
