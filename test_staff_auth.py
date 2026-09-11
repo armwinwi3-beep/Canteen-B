@@ -40,5 +40,24 @@ class StaffSecurityTests(unittest.TestCase):
             self.assertEqual(result.status_code, 200)
             database.return_value.auth.sign_in_with_password.assert_not_called()
 
+    def test_admin_cannot_use_merchant_dashboard(self):
+        from admin_auth import current_staff
+        app.dependency_overrides[current_staff] = lambda: {'role': 'admin', 'store_id': None}
+        try:
+            self.assertEqual(self.client.get('/merchant/dashboard').status_code, 403)
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_product_payload_rejects_negative_values(self):
+        from admin_auth import current_staff
+        app.dependency_overrides[current_staff] = lambda: {'role': 'merchant', 'store_id': 'store-a'}
+        try:
+            response = self.client.post('/merchant/products', json={
+                'name': 'ข้าว', 'price': -1, 'cost': 0, 'stock': -1, 'is_tracking': True,
+            })
+            self.assertEqual(response.status_code, 422)
+        finally:
+            app.dependency_overrides.clear()
+
 if __name__ == '__main__':
     unittest.main()
