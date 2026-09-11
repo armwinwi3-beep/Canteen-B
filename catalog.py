@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, Field
+from datetime import datetime, time, timedelta, timezone
 from uuid import uuid4
 
 from customer_auth import current_customer, customer_db
@@ -17,6 +18,22 @@ class OrderCreate(BaseModel):
 
 def _no_store_cache(response: Response) -> None:
     response.headers["Cache-Control"] = "no-store"
+
+
+def _daily_order_code(db, store: dict) -> str:
+    bangkok = timezone(timedelta(hours=7))
+    today = datetime.now(bangkok).date()
+    start = datetime.combine(today, time.min, bangkok).astimezone(timezone.utc)
+    end = start + timedelta(days=1)
+    rows = (
+        db.table("orders").select("id", count="exact")
+        .eq("merchant_id", store["id"])
+        .gte("created_at", start.isoformat())
+        .lt("created_at", end.isoformat())
+        .execute()
+    )
+    prefix = "".join(char for char in str(store.get("name") or "") if char.isalnum())[:3].upper() or "Q"
+    return f"{prefix}-{(rows.count or len(rows.data or [])) + 1:03d}"
 
 
 @router.get("/stores")
@@ -75,7 +92,7 @@ def create_order(body: OrderCreate, customer=Depends(current_customer)):
         qty = quantities[str(product["id"])]
         if product["is_tracking"] and product["stock"] < qty: raise HTTPException(409, f"{product['name']} has insufficient stock")
         total += float(product["price"]) * qty
-    order_id, code = str(uuid4()), f"WEB-{uuid4().hex[:8].upper()}"
+    order_id, code = str(uuid4()), _daily_order_code(db, stores[0])
     try:
         db.table("orders").insert({"id":order_id,"order_code":code,"merchant_id":body.store_id,"customer_id":customer["id"],"customer_name":customer["display_name"],"order_type":"online","total_price":total,"status":"pending"}).execute()
         db.table("order_items").insert([{"order_id":order_id,"product_id":p["id"],"name":p["name"],"qty":quantities[str(p["id"])],"price":float(p["price"]),"cost":float(p.get("cost") or 0)} for p in rows]).execute()
