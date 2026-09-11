@@ -7,6 +7,7 @@ from uuid import uuid4
 from pydantic import BaseModel, Field
 
 from admin_auth import current_staff, staff_db
+from line_notifications import notify_order_status
 
 router = APIRouter(prefix="/merchant", tags=["merchant"])
 ORDER_STATUSES = {"pending", "cooking", "completed", "cancelled"}
@@ -105,6 +106,8 @@ def update_order_status(order_id: str, body: OrderStatusUpdate, account=Depends(
     rows = staff_db().table("orders").update({"status": body.status}).eq("id", order_id).eq("merchant_id", account["store_id"]).execute().data or []
     if not rows:
         raise HTTPException(404, "Order not found")
+    stores = staff_db().table("stores").select("name").eq("id", account["store_id"]).limit(1).execute().data or []
+    notify_order_status(rows[0], stores[0]["name"] if stores else "ร้านอาหาร")
     return {"order": rows[0]}
 
 @router.post("/products/{product_id}/image")
