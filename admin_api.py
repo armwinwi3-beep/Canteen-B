@@ -4,7 +4,7 @@ import re
 from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, Field
 
-from admin_auth import current_admin, current_staff, staff_db
+from admin_auth import current_admin, current_staff, staff_db, staff_auth_client
 
 router = APIRouter(prefix="/staff", tags=["staff"])
 USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,31}$")
@@ -44,7 +44,7 @@ def _session_payload(auth_response) -> dict:
 def login(body: LoginRequest, response: Response):
     response.headers["Cache-Control"] = "no-store"
     try:
-        result = staff_db().auth.sign_in_with_password({
+        result = staff_auth_client().auth.sign_in_with_password({
             "email": body.email.strip().lower(), "password": body.password,
         })
     except Exception:
@@ -54,9 +54,7 @@ def login(body: LoginRequest, response: Response):
     try:
         user_id = str(result.user.id)
         rows = staff_db().table("staff_accounts").select("role").eq("user_id", user_id).limit(1).execute().data or []
-        allowed = bool(rows) or (result.user.email or "").lower() in {
-            value.strip().lower() for value in __import__("os").getenv("ADMIN_EMAILS", "admin@btadapp.com").split(",")
-        }
+        allowed = bool(rows)
         if not allowed:
             raise HTTPException(403, "This account has no staff access")
     except HTTPException:
@@ -70,7 +68,7 @@ def login(body: LoginRequest, response: Response):
 def refresh(body: RefreshRequest, response: Response):
     response.headers["Cache-Control"] = "no-store"
     try:
-        return _session_payload(staff_db().auth.refresh_session(body.refresh_token))
+        return _session_payload(staff_auth_client().auth.refresh_session(body.refresh_token))
     except Exception:
         raise HTTPException(401, "Staff session has expired") from None
 
@@ -98,6 +96,8 @@ def create_store(body: CreateStoreRequest, _admin=Depends(current_admin)):
         raise HTTPException(422, "Store name is required")
     if not USERNAME_RE.fullmatch(username):
         raise HTTPException(422, "Username must be 3-32 lowercase letters, numbers, dot, dash or underscore")
+    if username == "admin":
+        raise HTTPException(422, "This username is reserved")
     email = f"{username}@btadapp.com"
     try:
         created = staff_db().auth.admin.create_user({

@@ -18,12 +18,9 @@ def staff_db():
     return create_client(url, key)
 
 
-def _bootstrap_admin_emails() -> set[str]:
-    return {
-        email.strip().lower()
-        for email in os.getenv("ADMIN_EMAILS", "admin@btadapp.com").split(",")
-        if email.strip()
-    }
+def staff_auth_client():
+    # Never sign users into the cached service-role database client.
+    return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SECRET_KEY"])
 
 
 def current_staff(credentials: HTTPAuthorizationCredentials = Depends(bearer)) -> dict:
@@ -44,12 +41,7 @@ def current_staff(credentials: HTTPAuthorizationCredentials = Depends(bearer)) -
     if rows:
         return rows[0]
 
-    email = auth_user.email.lower()
-    if email not in _bootstrap_admin_emails():
-        raise HTTPException(403, "This account has no staff access")
-    admin = {"user_id": str(auth_user.id), "email": email, "role": "admin", "store_id": None}
-    staff_db().table("staff_accounts").insert(admin).execute()
-    return admin
+    raise HTTPException(403, "This account has no staff access")
 
 
 def current_admin(staff: dict = Depends(current_staff)) -> dict:
