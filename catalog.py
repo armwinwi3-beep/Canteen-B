@@ -4,6 +4,7 @@ from datetime import datetime, time, timedelta, timezone
 from uuid import uuid4
 
 from customer_auth import current_customer, customer_db
+from line_notifications import notify_order_status
 
 router = APIRouter(prefix="/customer", tags=["customer catalog"])
 
@@ -126,4 +127,12 @@ def create_order(body: OrderCreate, customer=Depends(current_customer)):
     except Exception:
         db.table("order_items").delete().eq("order_id", order_id).execute(); db.table("orders").delete().eq("id", order_id).execute()
         raise HTTPException(503, "Unable to place order") from None
-    return {"order":{"id":order_id,"order_code":code,"total_price":total,"status":"pending"}}
+    order = {
+        "id": order_id,
+        "order_code": code,
+        "customer_id": customer["id"],
+        "total_price": total,
+        "status": "pending",
+    }
+    notify_order_status(order, stores[0]["name"])
+    return {"order": {key: value for key, value in order.items() if key != "customer_id"}}
