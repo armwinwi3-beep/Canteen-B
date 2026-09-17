@@ -10,7 +10,7 @@ class StaffSecurityTests(unittest.TestCase):
         self.client = TestClient(app)
 
     def test_anonymous_cannot_manage_stores(self):
-        for method, path, body in [('get', '/staff/stores', None), ('post', '/staff/stores', {}), ('patch', '/staff/stores/a', {'is_open': True})]:
+        for method, path, body in [('get', '/staff/stores', None), ('post', '/staff/stores', {}), ('patch', '/staff/stores/a', {'is_open': True}), ('post', '/staff/password', {'current_password':'old-password','new_password':'new-password'})]:
             kwargs = {'json': body} if body is not None else {}
             self.assertEqual(getattr(self.client, method)(path, **kwargs).status_code, 401)
 
@@ -48,6 +48,26 @@ class StaffSecurityTests(unittest.TestCase):
         app.dependency_overrides[current_staff] = lambda: {'role': 'admin', 'store_id': None}
         try:
             self.assertEqual(self.client.get('/merchant/dashboard').status_code, 403)
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_staff_can_change_password_after_current_password_check(self):
+        from admin_auth import current_staff
+        app.dependency_overrides[current_staff] = lambda: {
+            'user_id': 'admin-id', 'email': 'admin@accounts.canteen.local', 'role': 'admin', 'store_id': None,
+        }
+        try:
+            with patch('admin_api.staff_auth_client') as auth, patch('admin_api.staff_db') as database:
+                result = self.client.post('/staff/password', json={
+                    'current_password': 'old-password', 'new_password': 'new-password',
+                })
+                self.assertEqual(result.status_code, 200)
+                auth.return_value.auth.sign_in_with_password.assert_called_once_with({
+                    'email': 'admin@accounts.canteen.local', 'password': 'old-password',
+                })
+                database.return_value.auth.admin.update_user_by_id.assert_called_once_with(
+                    'admin-id', {'password': 'new-password'},
+                )
         finally:
             app.dependency_overrides.clear()
 

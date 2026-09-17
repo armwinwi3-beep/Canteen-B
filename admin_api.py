@@ -19,6 +19,11 @@ class RefreshRequest(BaseModel):
     refresh_token: str = Field(min_length=20, max_length=4096)
 
 
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=8, max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
+
+
 class CreateStoreRequest(BaseModel):
     store_name: str = Field(min_length=1, max_length=100)
     username: str = Field(min_length=3, max_length=32)
@@ -80,6 +85,25 @@ def refresh(body: RefreshRequest, response: Response):
 def me(response: Response, staff=Depends(current_staff)):
     response.headers["Cache-Control"] = "no-store"
     return {"staff": staff}
+
+
+@router.post("/password")
+def change_password(body: ChangePasswordRequest, staff=Depends(current_staff)):
+    if body.current_password == body.new_password:
+        raise HTTPException(422, "New password must be different from the current password")
+    try:
+        staff_auth_client().auth.sign_in_with_password({
+            "email": staff["email"], "password": body.current_password,
+        })
+    except Exception:
+        raise HTTPException(401, "Current password is incorrect") from None
+    try:
+        staff_db().auth.admin.update_user_by_id(
+            staff["user_id"], {"password": body.new_password},
+        )
+    except Exception:
+        raise HTTPException(503, "Unable to change password") from None
+    return {"message": "Password changed"}
 
 
 @router.get("/stores")
