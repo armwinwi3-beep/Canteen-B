@@ -135,7 +135,20 @@ def daily_report(day: date, response: Response, account=Depends(merchant)):
     no_cache(response); tz=timezone(timedelta(hours=7)); start=datetime.combine(day,time.min,tz).astimezone(timezone.utc); end=start+timedelta(days=1)
     orders=staff_db().table("orders").select("id,total_price").eq("merchant_id",account["store_id"]).eq("status","completed").gte("created_at",start.isoformat()).lt("created_at",end.isoformat()).execute().data or []
     ids=[o["id"] for o in orders]; items=[]
-    if ids: items=staff_db().table("order_items").select("qty,cost").in_("order_id",ids).execute().data or []
+    if ids: items=staff_db().table("order_items").select("product_id,name,qty,price,cost").in_("order_id",ids).execute().data or []
+    products=staff_db().table("products").select("id,name,stock,is_tracking").eq("merchant_id",account["store_id"]).execute().data or []
+    product_lookup={str(product["id"]):product for product in products}
+    sales_by_product={}
+    for item in items:
+        product_id=str(item.get("product_id") or "")
+        sale=sales_by_product.setdefault(product_id,{"product_id":product_id,"name":item["name"],"quantity":0,"sales":0.0})
+        sale["quantity"]+=int(item["qty"])
+        sale["sales"]+=int(item["qty"])*float(item["price"])
+    product_sales=[]
+    for product_id,sale in sales_by_product.items():
+        product=product_lookup.get(product_id)
+        product_sales.append({**sale,"stock":product.get("stock") if product and product.get("is_tracking") else None,"is_tracking":bool(product and product.get("is_tracking"))})
+    product_sales.sort(key=lambda item:(-item["quantity"],item["name"]))
     expenses=staff_db().table("expenses").select("id,description,amount,expense_date,created_at").eq("merchant_id",account["store_id"]).eq("expense_date",day.isoformat()).order("created_at",desc=True).execute().data or []
     revenue=sum(float(o["total_price"]) for o in orders); cost=sum(int(i["qty"])*float(i.get("cost") or 0) for i in items); expense=sum(float(e["amount"]) for e in expenses)
-    return {"day":day,"revenue":revenue,"cost":cost,"expenses_total":expense,"net_income":revenue-cost-expense,"completed_orders":len(orders),"expenses":expenses}
+    return {"day":day,"revenue":revenue,"cost":cost,"expenses_total":expense,"net_income":revenue-cost-expense,"completed_orders":len(orders),"product_sales":product_sales,"expenses":expenses}
