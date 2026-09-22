@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, Field
 from datetime import datetime, time, timedelta, timezone
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from customer_auth import current_customer, customer_db
 from line_notifications import notify_order_status
@@ -104,6 +104,22 @@ def list_customer_orders(response: Response, customer=Depends(current_customer))
         items_by_order.setdefault(str(item["order_id"]), []).append(item)
     store_names = {str(store["id"]): store["name"] for store in stores}
     return {"orders": [{**order, "store_name": store_names.get(str(order["merchant_id"]), "ร้านอาหาร"), "items": items_by_order.get(str(order["id"]), [])} for order in orders]}
+
+
+@router.get("/public/orders/{order_id}")
+def public_order_tracking(order_id: UUID, response: Response):
+    _no_store_cache(response)
+    db = customer_db()
+    orders = db.table("orders").select("id,order_code,merchant_id,total_price,status,created_at").eq("id", str(order_id)).limit(1).execute().data or []
+    if not orders:
+        raise HTTPException(404, "Order not found")
+    order = orders[0]
+    stores = db.table("stores").select("name").eq("id", order["merchant_id"]).limit(1).execute().data or []
+    items = db.table("order_items").select("id,name,qty,price").eq("order_id", str(order_id)).execute().data or []
+    active = db.table("orders").select("id,status,created_at").eq("merchant_id", order["merchant_id"]).in_("status", ["pending", "cooking"]).order("created_at").execute().data or []
+    active_ids = [str(item["id"]) for item in active]
+    position = active_ids.index(str(order_id)) + 1 if str(order_id) in active_ids else None
+    return {"order":{**order,"store_name":stores[0]["name"] if stores else "ร้านอาหาร","items":items,"position":position,"queue_ahead":position-1 if position else 0,"active_queue":len(active)}}
 
 @router.post("/orders", status_code=201)
 def create_order(body: OrderCreate, customer=Depends(current_customer)):

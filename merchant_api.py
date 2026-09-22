@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from admin_auth import current_staff, staff_db
 from line_notifications import notify_order_status
+from catalog import _daily_order_code
 
 router = APIRouter(prefix="/merchant", tags=["merchant"])
 ORDER_STATUSES = {"pending", "cooking", "completed", "cancelled"}
@@ -32,6 +33,16 @@ class ExpenseCreate(BaseModel):
     description: str = Field(min_length=1, max_length=200)
     amount: Decimal = Field(gt=0, decimal_places=2)
     expense_date: date
+
+
+class WalkInItem(BaseModel):
+    product_id: str
+    qty: int = Field(ge=1, le=99)
+
+
+class WalkInOrderCreate(BaseModel):
+    customer_name: str = Field(default="ลูกค้าหน้าร้าน", max_length=100)
+    items: list[WalkInItem] = Field(min_length=1, max_length=50)
 
 
 def merchant(staff: dict = Depends(current_staff)) -> dict:
@@ -109,6 +120,37 @@ def update_order_status(order_id: str, body: OrderStatusUpdate, account=Depends(
     stores = staff_db().table("stores").select("name").eq("id", account["store_id"]).limit(1).execute().data or []
     notify_order_status(rows[0], stores[0]["name"] if stores else "ร้านอาหาร")
     return {"order": rows[0]}
+
+
+@router.post("/walk-in-orders", status_code=201)
+def create_walk_in_order(body: WalkInOrderCreate, account=Depends(merchant)):
+    db = staff_db()
+    stores = db.table("stores").select("id,name").eq("id", account["store_id"]).limit(1).execute().data or []
+    if not stores:
+        raise HTTPException(404, "Store not found")
+    quantities = {item.product_id: item.qty for item in body.items}
+    products = db.table("products").select("id,name,price,cost,stock,is_tracking").eq("merchant_id", account["store_id"]).in_("id", list(quantities)).execute().data or []
+    if len(products) != len(quantities):
+        raise HTTPException(422, "Some products are unavailable")
+    total = 0.0
+    for product in products:
+        qty = quantities[str(product["id"])]
+        if product["is_tracking"] and product["stock"] < qty:
+            raise HTTPException(409, f"{product['name']} has insufficient stock")
+        total += float(product["price"]) * qty
+    order_id, code = str(uuid4()), _daily_order_code(db, stores[0])
+    customer_name = body.customer_name.strip() or "ลูกค้าหน้าร้าน"
+    try:
+        db.table("orders").insert({"id":order_id,"order_code":code,"merchant_id":account["store_id"],"customer_name":customer_name,"order_type":"walk_in","total_price":total,"status":"pending"}).execute()
+        db.table("order_items").insert([{"order_id":order_id,"product_id":p["id"],"name":p["name"],"qty":quantities[str(p["id"])],"price":float(p["price"]),"cost":float(p.get("cost") or 0)} for p in products]).execute()
+        for product in products:
+            if product["is_tracking"]:
+                db.table("products").update({"stock":product["stock"]-quantities[str(product["id"])]}).eq("id",product["id"]).eq("merchant_id",account["store_id"]).execute()
+    except Exception:
+        db.table("order_items").delete().eq("order_id", order_id).execute()
+        db.table("orders").delete().eq("id", order_id).execute()
+        raise HTTPException(503, "Unable to place walk-in order") from None
+    return {"order":{"id":order_id,"order_code":code,"customer_name":customer_name,"total_price":total,"status":"pending","tracking_path":f"/track/{order_id}"}}
 
 @router.post("/products/{product_id}/image")
 async def upload_product_image(product_id: str, image: UploadFile = File(...), account=Depends(merchant)):
