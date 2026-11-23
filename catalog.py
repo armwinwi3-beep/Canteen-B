@@ -1,7 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, Field
-from datetime import datetime, time, timedelta, timezone
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from customer_auth import current_customer, customer_db
 from line_notifications import notify_order_status
@@ -21,20 +20,37 @@ def _no_store_cache(response: Response) -> None:
     response.headers["Cache-Control"] = "no-store"
 
 
-def _daily_order_code(db, store: dict) -> str:
-    bangkok = timezone(timedelta(hours=7))
-    today = datetime.now(bangkok).date()
-    start = datetime.combine(today, time.min, bangkok).astimezone(timezone.utc)
-    end = start + timedelta(days=1)
-    rows = (
-        db.table("orders").select("id", count="exact")
-        .eq("merchant_id", store["id"])
-        .gte("created_at", start.isoformat())
-        .lt("created_at", end.isoformat())
-        .execute()
-    )
-    prefix = "".join(char for char in str(store.get("name") or "") if char.isalnum())[:3].upper() or "Q"
-    return f"{prefix}-{(rows.count or len(rows.data or [])) + 1:03d}"
+def order_code_prefix(store: dict) -> str:
+    return "".join(char for char in str(store.get("name") or "") if char.isalnum())[:3].upper() or "Q"
+
+
+def _rpc_failure(exc: Exception) -> tuple[str, str]:
+    return str(getattr(exc, "message", "") or ""), str(getattr(exc, "code", "") or "")
+
+
+def place_order(db, store: dict, order_type: str, items, customer_id: str | None, customer_name: str) -> dict:
+    """Create the order, its items, stock changes and queue number in one DB transaction."""
+    try:
+        result = db.rpc("place_order", {
+            "p_merchant_id": store["id"],
+            "p_prefix": order_code_prefix(store),
+            "p_order_type": order_type,
+            "p_customer_id": customer_id,
+            "p_customer_name": customer_name,
+            "p_items": [{"product_id": item.product_id, "qty": item.qty} for item in items],
+        }).execute()
+    except Exception as exc:
+        message, code = _rpc_failure(exc)
+        if message == "store_closed":
+            raise HTTPException(409, "Store is closed") from None
+        if message == "product_unavailable" or code == "22P02":
+            raise HTTPException(422, "Some products are unavailable") from None
+        if message.startswith("insufficient_stock:"):
+            raise HTTPException(409, f"{message.split(':', 1)[1]} has insufficient stock") from None
+        raise HTTPException(503, "Unable to place order") from None
+    if not isinstance(result.data, dict) or not result.data.get("id"):
+        raise HTTPException(503, "Unable to place order")
+    return result.data
 
 
 @router.get("/stores")
@@ -126,29 +142,13 @@ def create_order(body: OrderCreate, customer=Depends(current_customer)):
     db = customer_db()
     stores = db.table("stores").select("id,name,is_open").eq("id", body.store_id).eq("is_open", True).limit(1).execute().data or []
     if not stores: raise HTTPException(409, "Store is closed")
-    quantities = {item.product_id: item.qty for item in body.items}
-    rows = db.table("products").select("id,name,price,cost,stock,is_tracking").eq("merchant_id", body.store_id).in_("id", list(quantities)).execute().data or []
-    if len(rows) != len(quantities): raise HTTPException(422, "Some products are unavailable")
-    total = 0.0
-    for product in rows:
-        qty = quantities[str(product["id"])]
-        if product["is_tracking"] and product["stock"] < qty: raise HTTPException(409, f"{product['name']} has insufficient stock")
-        total += float(product["price"]) * qty
-    order_id, code = str(uuid4()), _daily_order_code(db, stores[0])
-    try:
-        db.table("orders").insert({"id":order_id,"order_code":code,"merchant_id":body.store_id,"customer_id":customer["id"],"customer_name":customer["display_name"],"order_type":"online","total_price":total,"status":"pending"}).execute()
-        db.table("order_items").insert([{"order_id":order_id,"product_id":p["id"],"name":p["name"],"qty":quantities[str(p["id"])],"price":float(p["price"]),"cost":float(p.get("cost") or 0)} for p in rows]).execute()
-        for p in rows:
-            if p["is_tracking"]: db.table("products").update({"stock":p["stock"]-quantities[str(p["id"])]}).eq("id",p["id"]).eq("merchant_id",body.store_id).execute()
-    except Exception:
-        db.table("order_items").delete().eq("order_id", order_id).execute(); db.table("orders").delete().eq("id", order_id).execute()
-        raise HTTPException(503, "Unable to place order") from None
+    created = place_order(db, stores[0], "online", body.items, customer["id"], customer["display_name"])
     order = {
-        "id": order_id,
-        "order_code": code,
+        "id": created["id"],
+        "order_code": created["order_code"],
         "customer_id": customer["id"],
-        "total_price": total,
-        "status": "pending",
+        "total_price": float(created["total_price"]),
+        "status": created["status"],
     }
     notify_order_status(order, stores[0]["name"])
     return {"order": {key: value for key, value in order.items() if key != "customer_id"}}

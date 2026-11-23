@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from admin_auth import current_staff, staff_db
 from line_notifications import notify_order_status
-from catalog import _daily_order_code
+from catalog import _rpc_failure, place_order
 
 router = APIRouter(prefix="/merchant", tags=["merchant"])
 ORDER_STATUSES = {"pending", "cooking", "completed", "cancelled"}
@@ -114,12 +114,25 @@ def update_product(product_id: str, body: ProductUpdate, account=Depends(merchan
 def update_order_status(order_id: str, body: OrderStatusUpdate, account=Depends(merchant)):
     if body.status not in ORDER_STATUSES:
         raise HTTPException(422, "Invalid order status")
-    rows = staff_db().table("orders").update({"status": body.status}).eq("id", order_id).eq("merchant_id", account["store_id"]).execute().data or []
-    if not rows:
-        raise HTTPException(404, "Order not found")
-    stores = staff_db().table("stores").select("name").eq("id", account["store_id"]).limit(1).execute().data or []
-    notify_order_status(rows[0], stores[0]["name"] if stores else "ร้านอาหาร")
-    return {"order": rows[0]}
+    try:
+        # Locks the order; cancelling returns tracked stock in the same transaction.
+        result = staff_db().rpc("set_order_status", {
+            "p_order_id": order_id, "p_merchant_id": account["store_id"], "p_status": body.status,
+        }).execute().data
+    except Exception as exc:
+        message, code = _rpc_failure(exc)
+        if message == "order_not_found" or code == "22P02":
+            raise HTTPException(404, "Order not found") from None
+        if message == "order_cancelled":
+            raise HTTPException(409, "This order was already cancelled") from None
+        raise HTTPException(503, "Unable to update order") from None
+    if not isinstance(result, dict) or not isinstance(result.get("order"), dict):
+        raise HTTPException(503, "Unable to update order")
+    order = result["order"]
+    if result.get("changed"):
+        stores = staff_db().table("stores").select("name").eq("id", account["store_id"]).limit(1).execute().data or []
+        notify_order_status(order, stores[0]["name"] if stores else "ร้านอาหาร")
+    return {"order": order}
 
 
 @router.post("/walk-in-orders", status_code=201)
@@ -128,29 +141,10 @@ def create_walk_in_order(body: WalkInOrderCreate, account=Depends(merchant)):
     stores = db.table("stores").select("id,name").eq("id", account["store_id"]).limit(1).execute().data or []
     if not stores:
         raise HTTPException(404, "Store not found")
-    quantities = {item.product_id: item.qty for item in body.items}
-    products = db.table("products").select("id,name,price,cost,stock,is_tracking").eq("merchant_id", account["store_id"]).in_("id", list(quantities)).execute().data or []
-    if len(products) != len(quantities):
-        raise HTTPException(422, "Some products are unavailable")
-    total = 0.0
-    for product in products:
-        qty = quantities[str(product["id"])]
-        if product["is_tracking"] and product["stock"] < qty:
-            raise HTTPException(409, f"{product['name']} has insufficient stock")
-        total += float(product["price"]) * qty
-    order_id, code = str(uuid4()), _daily_order_code(db, stores[0])
     customer_name = body.customer_name.strip() or "ลูกค้าหน้าร้าน"
-    try:
-        db.table("orders").insert({"id":order_id,"order_code":code,"merchant_id":account["store_id"],"customer_name":customer_name,"order_type":"walk_in","total_price":total,"status":"pending"}).execute()
-        db.table("order_items").insert([{"order_id":order_id,"product_id":p["id"],"name":p["name"],"qty":quantities[str(p["id"])],"price":float(p["price"]),"cost":float(p.get("cost") or 0)} for p in products]).execute()
-        for product in products:
-            if product["is_tracking"]:
-                db.table("products").update({"stock":product["stock"]-quantities[str(product["id"])]}).eq("id",product["id"]).eq("merchant_id",account["store_id"]).execute()
-    except Exception:
-        db.table("order_items").delete().eq("order_id", order_id).execute()
-        db.table("orders").delete().eq("id", order_id).execute()
-        raise HTTPException(503, "Unable to place walk-in order") from None
-    return {"order":{"id":order_id,"order_code":code,"customer_name":customer_name,"total_price":total,"status":"pending","tracking_path":f"/track/{order_id}"}}
+    created = place_order(db, stores[0], "walk_in", body.items, None, customer_name)
+    order_id = created["id"]
+    return {"order":{"id":order_id,"order_code":created["order_code"],"customer_name":customer_name,"total_price":float(created["total_price"]),"status":created["status"],"tracking_path":f"/track/{order_id}"}}
 
 @router.post("/products/{product_id}/image")
 async def upload_product_image(product_id: str, image: UploadFile = File(...), account=Depends(merchant)):
