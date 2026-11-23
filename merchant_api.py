@@ -1,7 +1,7 @@
 """Merchant-scoped menu and order management API."""
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Response, UploadFile
 from datetime import date, datetime, time, timedelta, timezone
 from uuid import uuid4
 from pydantic import BaseModel, Field
@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from admin_auth import current_staff, staff_db
 from line_notifications import notify_order_status
 from catalog import _rpc_failure, place_order
+from parallel import run_parallel
 
 router = APIRouter(prefix="/merchant", tags=["merchant"])
 ORDER_STATUSES = {"pending", "cooking", "completed", "cancelled"}
@@ -59,11 +60,14 @@ def no_cache(response: Response) -> None:
 def dashboard(response: Response, account=Depends(merchant)):
     no_cache(response)
     store_id = account["store_id"]
-    stores = staff_db().table("stores").select("id,name,is_open").eq("id", store_id).limit(1).execute().data or []
+    db = staff_db()
+    stores, products, orders = run_parallel(
+        lambda: db.table("stores").select("id,name,is_open").eq("id", store_id).limit(1).execute().data or [],
+        lambda: db.table("products").select("id,name,price,cost,stock,is_tracking,image_url,created_at").eq("merchant_id", store_id).order("created_at").execute().data or [],
+        lambda: db.table("orders").select("id,order_code,customer_name,order_type,total_price,status,created_at").eq("merchant_id", store_id).order("created_at", desc=True).limit(100).execute().data or [],
+    )
     if not stores:
         raise HTTPException(404, "Store not found")
-    products = staff_db().table("products").select("id,name,price,cost,stock,is_tracking,image_url,created_at").eq("merchant_id", store_id).order("created_at").execute().data or []
-    orders = staff_db().table("orders").select("id,order_code,customer_name,order_type,total_price,status,created_at").eq("merchant_id", store_id).order("created_at", desc=True).limit(100).execute().data or []
     order_ids = [row["id"] for row in orders]
     items = []
     if order_ids:
@@ -111,7 +115,7 @@ def update_product(product_id: str, body: ProductUpdate, account=Depends(merchan
 
 
 @router.patch("/orders/{order_id}")
-def update_order_status(order_id: str, body: OrderStatusUpdate, account=Depends(merchant)):
+def update_order_status(order_id: str, body: OrderStatusUpdate, background: BackgroundTasks, account=Depends(merchant)):
     if body.status not in ORDER_STATUSES:
         raise HTTPException(422, "Invalid order status")
     try:
@@ -130,9 +134,14 @@ def update_order_status(order_id: str, body: OrderStatusUpdate, account=Depends(
         raise HTTPException(503, "Unable to update order")
     order = result["order"]
     if result.get("changed"):
-        stores = staff_db().table("stores").select("name").eq("id", account["store_id"]).limit(1).execute().data or []
-        notify_order_status(order, stores[0]["name"] if stores else "ร้านอาหาร")
+        # Sent after the response so the merchant's button reacts immediately.
+        background.add_task(_notify_with_store_name, order, account["store_id"])
     return {"order": order}
+
+
+def _notify_with_store_name(order: dict, store_id: str) -> None:
+    stores = staff_db().table("stores").select("name").eq("id", store_id).limit(1).execute().data or []
+    notify_order_status(order, stores[0]["name"] if stores else "ร้านอาหาร")
 
 
 @router.post("/walk-in-orders", status_code=201)
@@ -169,10 +178,14 @@ def create_expense(body: ExpenseCreate, account=Depends(merchant)):
 @router.get("/reports/daily")
 def daily_report(day: date, response: Response, account=Depends(merchant)):
     no_cache(response); tz=timezone(timedelta(hours=7)); start=datetime.combine(day,time.min,tz).astimezone(timezone.utc); end=start+timedelta(days=1)
-    orders=staff_db().table("orders").select("id,total_price").eq("merchant_id",account["store_id"]).eq("status","completed").gte("created_at",start.isoformat()).lt("created_at",end.isoformat()).execute().data or []
+    db=staff_db(); store_id=account["store_id"]
+    orders,products,expenses=run_parallel(
+        lambda: db.table("orders").select("id,total_price").eq("merchant_id",store_id).eq("status","completed").gte("created_at",start.isoformat()).lt("created_at",end.isoformat()).execute().data or [],
+        lambda: db.table("products").select("id,name,stock,is_tracking").eq("merchant_id",store_id).execute().data or [],
+        lambda: db.table("expenses").select("id,description,amount,expense_date,created_at").eq("merchant_id",store_id).eq("expense_date",day.isoformat()).order("created_at",desc=True).execute().data or [],
+    )
     ids=[o["id"] for o in orders]; items=[]
-    if ids: items=staff_db().table("order_items").select("product_id,name,qty,price,cost").in_("order_id",ids).execute().data or []
-    products=staff_db().table("products").select("id,name,stock,is_tracking").eq("merchant_id",account["store_id"]).execute().data or []
+    if ids: items=db.table("order_items").select("product_id,name,qty,price,cost").in_("order_id",ids).execute().data or []
     product_lookup={str(product["id"]):product for product in products}
     sales_by_product={}
     for item in items:
@@ -185,6 +198,5 @@ def daily_report(day: date, response: Response, account=Depends(merchant)):
         product=product_lookup.get(product_id)
         product_sales.append({**sale,"stock":product.get("stock") if product and product.get("is_tracking") else None,"is_tracking":bool(product and product.get("is_tracking"))})
     product_sales.sort(key=lambda item:(-item["quantity"],item["name"]))
-    expenses=staff_db().table("expenses").select("id,description,amount,expense_date,created_at").eq("merchant_id",account["store_id"]).eq("expense_date",day.isoformat()).order("created_at",desc=True).execute().data or []
     revenue=sum(float(o["total_price"]) for o in orders); cost=sum(int(i["qty"])*float(i.get("cost") or 0) for i in items); expense=sum(float(e["amount"]) for e in expenses)
     return {"day":day,"revenue":revenue,"cost":cost,"expenses_total":expense,"net_income":revenue-cost-expense,"completed_orders":len(orders),"product_sales":product_sales,"expenses":expenses}

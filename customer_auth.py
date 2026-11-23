@@ -9,6 +9,10 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from supabase import create_client
 
+from parallel import pooled_client_options
+from token_cache import TokenCache
+
+verified_customers = TokenCache()
 router = APIRouter(prefix="/auth", tags=["customer auth"])
 bearer = HTTPBearer(auto_error=False)
 IDENTITY_NAMESPACE = UUID("8759f361-ef24-4f78-bfd9-8a00ca5d1669")
@@ -20,7 +24,7 @@ def customer_db():
     key = os.getenv("SUPABASE_SECRET_KEY")
     if not url or not key:
         raise HTTPException(503, "Customer database is not configured")
-    return create_client(url, key)
+    return create_client(url, key, options=pooled_client_options())
 
 
 def verify_line_token(token: str) -> dict:
@@ -59,6 +63,11 @@ def current_customer(credentials: HTTPAuthorizationCredentials = Depends(bearer)
         raise HTTPException(401, "LINE ID token is required")
     if len(credentials.credentials) > 16384:
         raise HTTPException(401, "Invalid LINE token")
+    # A verified token is reused until it expires (max 10 min) instead of calling
+    # LINE and writing the customer row on every request.
+    cached = verified_customers.get(credentials.credentials)
+    if cached:
+        return cached
     claims = verify_line_token(credentials.credentials)
     # Stable across repeated/concurrent logins; frontend cannot choose identity or role.
     customer = {
@@ -74,8 +83,10 @@ def current_customer(credentials: HTTPAuthorizationCredentials = Depends(bearer)
         raise
     except Exception:
         raise HTTPException(503, "Unable to save customer account") from None
-    return {"id": customer["id"], "display_name": customer["display_name"],
-            "picture_url": customer["picture_url"], "role": "customer"}
+    result = {"id": customer["id"], "display_name": customer["display_name"],
+              "picture_url": customer["picture_url"], "role": "customer"}
+    verified_customers.put(credentials.credentials, result, min(float(claims["exp"]), time.time() + 600))
+    return result
 
 
 @router.get("/me")

@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 import httpx
 from fastapi.testclient import TestClient
 from customer_app import app
+from customer_auth import verified_customers
 
 
 class CustomerAuthTests(unittest.TestCase):
@@ -13,6 +14,8 @@ class CustomerAuthTests(unittest.TestCase):
         self.env = patch.dict(os.environ, {"LINE_LOGIN_CHANNEL_ID": "123"})
         self.env.start()
         self.addCleanup(self.env.stop)
+        verified_customers.clear()
+        self.addCleanup(verified_customers.clear)
         self.client = TestClient(app)
         self.claims = {"iss": "https://access.line.me", "aud": "123", "sub": "Ualice",
                        "exp": time.time() + 600, "name": "Alice"}
@@ -52,7 +55,22 @@ class CustomerAuthTests(unittest.TestCase):
             self.assertNotIn('line_user_id', first.json()['customer'])
             self.assertEqual(db.return_value.table.call_args.args, ('line_customers',))
             self.claims = {**self.claims, 'sub': 'Ubob'}
-            self.assertNotEqual(first.json()['customer']['id'], self.request().json()['customer']['id'])
+            bob = self.client.get('/auth/me', headers={"Authorization": "Bearer bob-token"})
+            self.assertNotEqual(first.json()['customer']['id'], bob.json()['customer']['id'])
+
+    def test_verified_token_is_reused_without_calling_line_again(self):
+        with patch('customer_auth.httpx.post', return_value=Mock(status_code=200, json=lambda: self.claims)) as verify, patch('customer_auth.customer_db') as db:
+            for _ in range(3):
+                self.assertEqual(self.request().status_code, 200)
+        self.assertEqual(verify.call_count, 1)
+        self.assertEqual(db.return_value.table.return_value.upsert.call_count, 1)
+
+    def test_expired_cache_entry_verifies_again(self):
+        with patch('customer_auth.httpx.post', return_value=Mock(status_code=200, json=lambda: self.claims)) as verify, patch('customer_auth.customer_db'):
+            self.request()
+            with patch('token_cache.time.time', return_value=time.time() + 601):
+                self.request()
+        self.assertEqual(verify.call_count, 2)
 
     def test_database_failure_does_not_leak_details(self):
         with patch('customer_auth.httpx.post', return_value=Mock(status_code=200, json=lambda: self.claims)), patch('customer_auth.customer_db', side_effect=RuntimeError('secret')):
